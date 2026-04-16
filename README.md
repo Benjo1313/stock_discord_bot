@@ -48,7 +48,7 @@ python bot.py
 | `!scan` | Force immediate scan |
 | `!check NVDA` | Run indicators on any ticker |
 | `!signals [TICKER]` | Recent signal history |
-| `!debrief` | Watchlist summary with prices, signals, and headlines |
+| `!debrief` | Watchlist summary with market pulse (indices + sectors), prices, signals, and headlines with snippets |
 | `!market` | Broad market overview + market news |
 | `!news [TICKER]` | Recent news headlines (general or ticker-specific) |
 | `!weekly` | Full week recap: prices, signals, and news |
@@ -64,7 +64,7 @@ Weighted scoring system: multiple confirming indicators required to trigger BUY/
 ## Auto Scanning
 
 - Every 15 min during market hours (9:30 AM – 4:00 PM ET, Mon–Fri)
-- End-of-day debrief at 4:05 PM ET (includes news headlines)
+- End-of-day debrief at 4:05 PM ET (market pulse, watchlist prices, signals, and news with snippets)
 - Friday weekly recap auto-posts at 4:10 PM ET
 - Anti-spam: same signal suppressed for 2 hours
 

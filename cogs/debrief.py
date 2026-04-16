@@ -1,3 +1,4 @@
+import asyncio
 import re
 import logging
 from datetime import datetime, time as dt_time, timedelta
@@ -36,6 +37,40 @@ def _news_embed_field(headlines: list[dict], compact: bool = True) -> str:
 class Debrief(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+
+    @staticmethod
+    def _build_market_pulse(market_data: dict) -> str:
+        """Return a 2-line compact market summary string from get_market_overview() output."""
+        INDEX_ORDER = ["SPY", "QQQ", "DIA", "IWM"]
+        indices = market_data.get("indices", {})
+
+        index_parts = []
+        for sym in INDEX_ORDER:
+            info = indices.get(sym)
+            if not info:
+                continue
+            arrow = "🟢" if info["change_pct"] >= 0 else "🔴"
+            index_parts.append(f"{arrow} {info['name']} {info['change_pct']:+.2f}%")
+        line1 = " | ".join(index_parts)
+
+        sectors = market_data.get("sectors", {})
+        sorted_sectors = sorted(sectors.items(), key=lambda x: x[1].get("change_pct", 0), reverse=True)
+        top2 = sorted_sectors[:2]
+        bottom2 = sorted_sectors[-2:] if len(sorted_sectors) >= 2 else []
+        # avoid overlap when there are fewer than 4 sectors
+        bottom2 = [s for s in bottom2 if s not in top2]
+
+        up_parts = [f"{info['name']} {info['change_pct']:+.1f}%" for _, info in top2]
+        down_parts = [f"{info['name']} {info['change_pct']:+.1f}%" for _, info in bottom2]
+
+        line2_parts = []
+        if up_parts:
+            line2_parts.append("▲ " + ", ".join(up_parts))
+        if down_parts:
+            line2_parts.append("▼ " + ", ".join(down_parts))
+        line2 = " | ".join(line2_parts)
+
+        return f"{line1}\n{line2}" if line2 else line1
 
     async def cog_load(self):
         self.eod_debrief.start()
@@ -93,18 +128,23 @@ class Debrief(commands.Cog):
             timestamp=datetime.now(MARKET_TZ),
         )
 
+        # Market Pulse — broad market context
+        market_data = await asyncio.to_thread(get_market_overview)
+        pulse_text = self._build_market_pulse(market_data)
+        embed.add_field(name="Market Pulse", value=pulse_text, inline=False)
+
         lines = []
         signals_today = []
         for item in tickers:
             ticker = item["ticker"]
-            data = get_current_price(ticker)
+            data = await asyncio.to_thread(get_current_price, ticker)
             if data:
                 arrow = "🟢" if data["change"] >= 0 else "🔴"
                 lines.append(
                     f"{arrow} **{ticker}** ${data['price']:.2f} "
                     f"({data['change_pct']:+.2f}%) vol: {data['volume']:,.0f}"
                 )
-            snap = compute_indicators(ticker)
+            snap = await asyncio.to_thread(compute_indicators, ticker)
             if snap:
                 result = evaluate_signals(snap)
                 if result.signal_type in ("BUY", "STRONG BUY"):
@@ -124,11 +164,15 @@ class Debrief(commands.Cog):
                 inline=False,
             )
 
-        # News headlines (top 3, compact)
-        headlines = get_market_news(max_results=3)
-        news_text = _news_embed_field(headlines, compact=True)
+        # News headlines (top 3, with snippets)
+        headlines = await asyncio.to_thread(get_market_news, max_results=3)
+        news_text = _news_embed_field(headlines, compact=False)
         if news_text:
             embed.add_field(name="Headlines", value=news_text, inline=False)
+
+        # Embed size guard: drop Market Pulse if total chars exceed Discord's safe limit
+        if len(embed) > 5800:
+            embed._fields = [f for f in embed._fields if f["name"] != "Market Pulse"]
 
         return embed
 
@@ -144,11 +188,11 @@ class Debrief(commands.Cog):
         embeds = []
 
         # ── Embed 1: Weekly Market Recap ──────────────────────────────────────
-        market_data = get_market_overview()
+        market_data = await asyncio.to_thread(get_market_overview)
         index_lines = []
         for sym, info in market_data["indices"].items():
             # Use 5d yfinance data for weekly change
-            df = get_daily_data(sym, period="5d")
+            df = await asyncio.to_thread(get_daily_data, sym, "5d")
             if df is not None and len(df) >= 2:
                 week_open = float(df.iloc[0]["Open"])
                 week_close = float(df.iloc[-1]["Close"])
@@ -168,7 +212,7 @@ class Debrief(commands.Cog):
                 inline=False,
             )
 
-        weekly_headlines = get_weekly_news(max_results=8)
+        weekly_headlines = await asyncio.to_thread(get_weekly_news, max_results=8)
         news_text = _news_embed_field(weekly_headlines[:6], compact=True)
         if news_text:
             market_embed.add_field(name="Top Stories This Week", value=news_text, inline=False)
@@ -191,13 +235,13 @@ class Debrief(commands.Cog):
             ]
 
             # One batch search covers all tickers (vs. N separate calls)
-            ticker_news_map = get_batch_ticker_news(tickers, days=5, per_ticker=2)
+            ticker_news_map = await asyncio.to_thread(get_batch_ticker_news, tickers, 5, 2)
 
             for ticker in tickers:
                 lines = []
 
                 # Weekly price change
-                df = get_daily_data(ticker, period="5d")
+                df = await asyncio.to_thread(get_daily_data, ticker, "5d")
                 if df is not None and len(df) >= 2:
                     week_open = float(df.iloc[0]["Open"])
                     week_close = float(df.iloc[-1]["Close"])
@@ -234,7 +278,7 @@ class Debrief(commands.Cog):
         for item in tickers:
             ticker = item["ticker"]
             try:
-                df = get_daily_data(ticker, period="5d")
+                df = await asyncio.to_thread(get_daily_data, ticker, "5d")
                 if df is None or df.empty:
                     continue
                 last = df.iloc[-1]
@@ -272,7 +316,7 @@ class Debrief(commands.Cog):
     async def market_overview(self, ctx: commands.Context):
         """Broad market overview: indices, sector performance, and market news."""
         async with ctx.typing():
-            data = get_market_overview()
+            data = await asyncio.to_thread(get_market_overview)
             embed = discord.Embed(title="Market Overview", color=discord.Color.blue())
 
             index_lines = []
@@ -305,7 +349,7 @@ class Debrief(commands.Cog):
                 inline=False,
             )
 
-            headlines = get_market_news(max_results=3)
+            headlines = await asyncio.to_thread(get_market_news, max_results=3)
             news_text = _news_embed_field(headlines, compact=True)
             if news_text:
                 embed.add_field(name="Market News", value=news_text, inline=False)
@@ -318,11 +362,11 @@ class Debrief(commands.Cog):
         async with ctx.typing():
             if ticker:
                 ticker = ticker.upper().strip()
-                headlines = get_ticker_news(ticker, max_results=3)
+                headlines = await asyncio.to_thread(get_ticker_news, ticker, max_results=3)
                 title = f"News — {ticker}"
                 color = discord.Color.blue()
             else:
-                headlines = get_market_news(max_results=5)
+                headlines = await asyncio.to_thread(get_market_news, max_results=5)
                 title = "Market News"
                 color = discord.Color.blue()
 

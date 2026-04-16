@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -435,7 +436,7 @@ class Scanner(commands.Cog):
         for item in tickers:
             ticker = item["ticker"]
             try:
-                snap = compute_indicators(ticker)
+                snap = await asyncio.to_thread(compute_indicators, ticker)
                 if snap is None:
                     continue
                 result = evaluate_signals(snap)
@@ -478,7 +479,7 @@ class Scanner(commands.Cog):
         """Run indicators on any ticker. Usage: !check NVDA"""
         ticker = ticker.upper().strip()
         async with ctx.typing():
-            snap = compute_indicators(ticker)
+            snap = await asyncio.to_thread(compute_indicators, ticker)
             if snap is None:
                 await ctx.send(f"Could not fetch data for **{ticker}**.")
                 return
@@ -491,7 +492,7 @@ class Scanner(commands.Cog):
         """Show fundamental financial data for a ticker. Usage: !fundamentals AAPL"""
         ticker = ticker.upper().strip()
         async with ctx.typing():
-            fa = get_fundamentals(ticker)
+            fa = await asyncio.to_thread(get_fundamentals, ticker)
             if fa is None:
                 await ctx.send(f"Could not fetch fundamentals for **{ticker}**.")
                 return

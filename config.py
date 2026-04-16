@@ -1,6 +1,7 @@
 import os
+from zoneinfo import ZoneInfo
+
 from dotenv import load_dotenv
-import pytz
 
 load_dotenv()
 
@@ -9,7 +10,7 @@ ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0"))
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "15"))
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-MARKET_TZ = pytz.timezone("US/Eastern")
+MARKET_TZ = ZoneInfo("US/Eastern")
 MARKET_OPEN_HOUR = 9
 MARKET_OPEN_MINUTE = 30
 MARKET_CLOSE_HOUR = 16
