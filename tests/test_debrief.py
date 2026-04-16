@@ -19,14 +19,46 @@ def _make_discord_stub():
         @staticmethod
         def blue():
             return "blue"
+        @staticmethod
+        def green():
+            return "green"
+        @staticmethod
+        def dark_green():
+            return "dark_green"
+        @staticmethod
+        def greyple():
+            return "greyple"
+        @staticmethod
+        def orange():
+            return "orange"
+        @staticmethod
+        def red():
+            return "red"
+        @staticmethod
+        def dark_red():
+            return "dark_red"
+        @staticmethod
+        def yellow():
+            return "yellow"
 
     class Embed:
         def __init__(self, **kwargs):
             self._fields = []
             self.title = kwargs.get("title", "")
+            self.description = kwargs.get("description", None)
+            self.color = kwargs.get("color", None)
 
         def add_field(self, *, name, value, inline=False):
-            self._fields.append({"name": name, "value": value})
+            self._fields.append({"name": name, "value": value, "inline": inline})
+
+        @property
+        def fields(self):
+            class _Field:
+                def __init__(self, name, value, inline=False):
+                    self.name = name
+                    self.value = value
+                    self.inline = inline
+            return [_Field(**f) for f in self._fields]
 
         def __len__(self):
             total = len(self.title)
@@ -37,6 +69,11 @@ def _make_discord_stub():
     discord.Embed = Embed
     discord.Color = Color
     discord.Message = object
+
+    abc = types.ModuleType("discord.abc")
+    abc.Messageable = object
+    discord.abc = abc
+    sys.modules["discord.abc"] = abc
 
     ext = types.ModuleType("discord.ext")
     commands = types.ModuleType("discord.ext.commands")
@@ -105,11 +142,17 @@ _make_stub_module(
     "config",
     ALERT_CHANNEL_ID=123,
     MARKET_TZ=ZoneInfo("US/Eastern"),
+    SCAN_INTERVAL=15,
+    MARKET_OPEN_HOUR=9,
+    MARKET_OPEN_MINUTE=30,
+    MARKET_CLOSE_HOUR=16,
+    MARKET_CLOSE_MINUTE=0,
 )
 _make_stub_module(
     "services.market_data",
     get_current_price=MagicMock(return_value=None),
     get_daily_data=MagicMock(return_value=None),
+    get_fundamentals=MagicMock(return_value=None),
 )
 _make_stub_module(
     "services.market_summary",
@@ -125,14 +168,30 @@ _make_stub_module(
 _make_stub_module(
     "indicators.calculator",
     compute_indicators=MagicMock(return_value=None),
+    compute_extended_indicators=MagicMock(return_value=(None, None)),
+    IndicatorSnapshot=MagicMock,
 )
 _make_stub_module(
     "indicators.signals",
     evaluate_signals=MagicMock(return_value=MagicMock(signal_type="HOLD", score=0)),
+    evaluate_technical_signals=MagicMock(return_value=0),
+    evaluate_composite_signal=MagicMock(return_value=MagicMock(signal_type="NEUTRAL", score=0)),
+    SignalResult=MagicMock,
 )
 
 # Now we can safely import the module under test
 from cogs.debrief import Debrief, _news_embed_field  # noqa: E402
+
+# Remove stubs for modules that other test files need the real implementations of.
+# cogs.debrief already holds its own references (bound at import time), so
+# removing these from sys.modules only affects subsequent imports in other tests.
+for _stub_name in (
+    "config",
+    "indicators.calculator",
+    "indicators.signals",
+    "services.market_data",
+):
+    sys.modules.pop(_stub_name, None)
 
 
 # ---------------------------------------------------------------------------
