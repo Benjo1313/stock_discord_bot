@@ -5,6 +5,9 @@ import pandas as pd
 _cache: dict[str, tuple[float, pd.DataFrame]] = {}
 _CACHE_TTL = 300  # 5 minutes
 
+_fundamentals_cache: dict[str, tuple[float, dict]] = {}
+_FUNDAMENTALS_TTL = 1800  # 30 minutes — fundamentals don't change intraday
+
 
 def validate_ticker(symbol: str) -> bool:
     try:
@@ -34,6 +37,46 @@ def get_daily_data(symbol: str, period: str = "1y") -> pd.DataFrame | None:
         return None
 
 
+def get_weekly_data(symbol: str, period: str = "2y") -> pd.DataFrame | None:
+    """Fetch weekly OHLCV data. Used for 20-week SMA trend analysis."""
+    cache_key = f"{symbol}_{period}_weekly"
+    now = time.time()
+    if cache_key in _cache:
+        ts, df = _cache[cache_key]
+        if now - ts < _CACHE_TTL:
+            return df
+
+    try:
+        t = yf.Ticker(symbol)
+        df = t.history(period=period, interval="1wk")
+        if df.empty:
+            return None
+        _cache[cache_key] = (now, df)
+        return df
+    except Exception:
+        return None
+
+
+def get_monthly_data(symbol: str, period: str = "5y") -> pd.DataFrame | None:
+    """Fetch monthly OHLCV data. Used for 10-month SMA trend analysis."""
+    cache_key = f"{symbol}_{period}_monthly"
+    now = time.time()
+    if cache_key in _cache:
+        ts, df = _cache[cache_key]
+        if now - ts < _CACHE_TTL:
+            return df
+
+    try:
+        t = yf.Ticker(symbol)
+        df = t.history(period=period, interval="1mo")
+        if df.empty:
+            return None
+        _cache[cache_key] = (now, df)
+        return df
+    except Exception:
+        return None
+
+
 def get_intraday_data(symbol: str) -> pd.DataFrame | None:
     cache_key = f"{symbol}_intraday"
     now = time.time()
@@ -54,7 +97,16 @@ def get_intraday_data(symbol: str) -> pd.DataFrame | None:
 
 
 def get_fundamentals(symbol: str) -> dict | None:
-    """Fetch key fundamental data for a ticker via yfinance .info."""
+    """Fetch key fundamental data for a ticker via yfinance .info.
+
+    Uses a 30-minute cache — fundamentals don't change intraday.
+    """
+    now = time.time()
+    if symbol in _fundamentals_cache:
+        ts, data = _fundamentals_cache[symbol]
+        if now - ts < _FUNDAMENTALS_TTL:
+            return data
+
     try:
         info = yf.Ticker(symbol).info
 
@@ -62,11 +114,12 @@ def get_fundamentals(symbol: str) -> dict | None:
             val = info.get(key)
             return None if val in (None, "N/A", "", 0) else val
 
-        return {
+        result = {
             # Identity
             "name":               info.get("longName") or info.get("shortName", symbol),
             "sector":             info.get("sector"),
             "industry":           info.get("industry"),
+            "quote_type":         info.get("quoteType"),  # "ETF", "EQUITY", etc.
             # Valuation
             "market_cap":         _v("marketCap"),
             "enterprise_value":   _v("enterpriseValue"),
@@ -100,6 +153,8 @@ def get_fundamentals(symbol: str) -> dict | None:
             "recommendation":     info.get("recommendationKey"),
             "num_analysts":       _v("numberOfAnalystOpinions"),
         }
+        _fundamentals_cache[symbol] = (now, result)
+        return result
     except Exception:
         return None
 

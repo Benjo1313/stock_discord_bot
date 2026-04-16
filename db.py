@@ -40,10 +40,24 @@ CREATE TABLE IF NOT EXISTS daily_summary (
 """
 
 
+_MIGRATIONS = [
+    # Add composite score columns (old rows get NULL)
+    "ALTER TABLE signal_history ADD COLUMN fundamental_score INTEGER",
+    "ALTER TABLE signal_history ADD COLUMN trend_score INTEGER",
+    "ALTER TABLE signal_history ADD COLUMN technical_score INTEGER",
+]
+
+
 async def init_db():
     os.makedirs(DATA_DIR, exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.executescript(SCHEMA)
+        # Apply migrations idempotently
+        for sql in _MIGRATIONS:
+            try:
+                await conn.execute(sql)
+            except Exception:
+                pass  # column already exists
         await conn.commit()
 
 
@@ -92,12 +106,16 @@ async def save_signal(
     volume: float,
     rsi: float | None,
     macd_hist: float | None,
+    fundamental_score: int | None = None,
+    trend_score: int | None = None,
+    technical_score: int | None = None,
 ):
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute(
             """INSERT INTO signal_history
-               (ticker, signal_type, strength, triggers, price, volume, rsi, macd_hist)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               (ticker, signal_type, strength, triggers, price, volume, rsi, macd_hist,
+                fundamental_score, trend_score, technical_score)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ticker.upper(),
                 signal_type,
@@ -107,6 +125,9 @@ async def save_signal(
                 volume,
                 rsi,
                 macd_hist,
+                fundamental_score,
+                trend_score,
+                technical_score,
             ),
         )
         await conn.commit()

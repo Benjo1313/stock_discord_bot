@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 
 import discord
@@ -16,11 +18,27 @@ from config import (
     MARKET_CLOSE_HOUR,
     MARKET_CLOSE_MINUTE,
 )
-from indicators.calculator import compute_indicators, IndicatorSnapshot
-from indicators.signals import evaluate_signals, SignalResult
+from indicators.calculator import compute_indicators, compute_extended_indicators, IndicatorSnapshot
+from indicators.signals import evaluate_signals, evaluate_composite_signal, SignalResult
+from indicators.fundamentals import score_fundamentals, FundamentalScore
+from indicators.trend import TrendAnalysis
 from services.market_data import get_fundamentals
 
 log = logging.getLogger(__name__)
+
+
+@dataclass
+class _SuppressedEntry:
+    ticker: str
+    signal_type: str
+    score: int
+    gate_passed: bool
+    reason: str
+    timestamp: datetime
+
+
+# Ring buffer — keeps the last 50 suppressed signals (cleared on restart)
+_suppressed_buffer: deque[_SuppressedEntry] = deque(maxlen=50)
 
 
 def _is_market_hours() -> bool:
@@ -37,16 +55,16 @@ def _is_market_hours() -> bool:
 
 
 _SCORE_THRESHOLDS = [
-    (40,  "🟢🟢 STRONG BUY",  "Multiple strong bullish signals aligning"),
-    (25,  "🟢 BUY",           "Bullish setup with confirming indicators"),
-    (-15, "⚪ NEUTRAL",        "No clear directional edge"),
+    (55,  "🟢🟢 STRONG BUY",  "Multiple strong bullish signals aligning"),
+    (35,  "🟢 BUY",           "Bullish setup with confirming indicators"),
+    (-10, "⚪ NEUTRAL",        "No clear directional edge"),
     (-99, "🔴 CAUTION",        "Bearish signals present — watch carefully"),
 ]
 
 def _score_bar(score: int) -> str:
-    """Visual bar showing score on a -30 → 60 scale."""
-    clamped = max(-30, min(60, score))
-    filled = round((clamped + 30) / 90 * 10)
+    """Visual bar showing score on a -50 → 100 scale."""
+    clamped = max(-50, min(100, score))
+    filled = round((clamped + 50) / 150 * 10)
     bar = "█" * filled + "░" * (10 - filled)
     return f"`[{bar}]` {score:+d} pts"
 
@@ -94,7 +112,12 @@ def _bb_label(price: float, lower: float, middle: float, upper: float,
     return f"{note} | L${lower:.2f} M${middle:.2f} U${upper:.2f}"
 
 
-def _build_check_embed(snap: IndicatorSnapshot, result: SignalResult) -> discord.Embed:
+def _build_check_embed(
+    snap: IndicatorSnapshot,
+    result: SignalResult,
+    trend: TrendAnalysis | None = None,
+    fa: dict | None = None,
+) -> discord.Embed:
     color_map = {
         "STRONG BUY": discord.Color.green(),
         "BUY": discord.Color.dark_green(),
@@ -102,7 +125,7 @@ def _build_check_embed(snap: IndicatorSnapshot, result: SignalResult) -> discord
         "CAUTION": discord.Color.red(),
     }
     embed = discord.Embed(
-        title=f"{snap.ticker} Technical Analysis",
+        title=f"{snap.ticker} Analysis",
         color=color_map.get(result.signal_type, discord.Color.greyple()),
     )
 
@@ -113,12 +136,48 @@ def _build_check_embed(snap: IndicatorSnapshot, result: SignalResult) -> discord
             verdict_desc  = desc
             break
 
+    # Three-layer breakdown line
+    breakdown_parts = []
+    if result.fundamental_score is not None:
+        fund_pts = round(result.fundamental_score / 100 * 40)
+        breakdown_parts.append(f"Fund: {fund_pts}/40")
+    if result.trend_score is not None:
+        breakdown_parts.append(f"Trend: {result.trend_score:+d}/30")
+    breakdown_parts.append(f"Tech: {result.technical_score:+d}/30")
+    breakdown_str = " | ".join(breakdown_parts)
+    if result.fundamental_score is not None:
+        breakdown_str += f" | **Total: {result.score}**"
+
     embed.add_field(
         name="Overall Signal",
         value=f"{verdict_label}\n{_score_bar(result.score)}\n*{verdict_desc}*\n"
-              f"Score guide: ≥40 Strong Buy · ≥25 Buy · ≥−15 Neutral · <−15 Caution",
+              f"{breakdown_str}\n"
+              f"Score guide: ≥55 Strong Buy · ≥35 Buy · ≥−10 Neutral · <−10 Caution",
         inline=False,
     )
+
+    # ── Gate failure banner ───────────────────────────────────────────────────
+    if not result.gate_passed:
+        gate_reasons = "\n".join(f"• {r}" for r in result.triggers[:5]) or "Fundamental gate not passed"
+        embed.add_field(
+            name="⛔ Fundamental Gate Failed",
+            value=gate_reasons,
+            inline=False,
+        )
+
+    # ── Fundamentals summary (when fa available) ──────────────────────────────
+    if fa:
+        fa_parts = []
+        if fa.get("pe_forward") is not None:
+            fa_parts.append(f"P/E {fa['pe_forward']:.0f}x")
+        if fa.get("roe") is not None:
+            fa_parts.append(f"ROE {fa['roe'] * 100:.0f}%")
+        if fa.get("free_cash_flow") is not None:
+            fa_parts.append(f"FCF {_fmt_large(fa['free_cash_flow'])}")
+        if fa.get("debt_to_equity") is not None:
+            fa_parts.append(f"D/E {fa['debt_to_equity']:.0f}%")
+        if fa_parts:
+            embed.add_field(name="Fundamentals", value=" | ".join(fa_parts), inline=False)
 
     # ── Price & Volume ────────────────────────────────────────────────────────
     embed.add_field(name="Price",  value=f"${snap.price:.2f}", inline=True)
@@ -137,8 +196,16 @@ def _build_check_embed(snap: IndicatorSnapshot, result: SignalResult) -> discord
     if momentum_lines:
         embed.add_field(name="Momentum", value="\n".join(momentum_lines), inline=False)
 
-    # ── Trend (Moving Averages) ───────────────────────────────────────────────
+    # ── Trend (multi-timeframe + moving averages) ─────────────────────────────
     trend_lines = []
+    if trend is not None:
+        weekly_lbl = {"up": "Uptrend 📈", "down": "Downtrend 📉", "sideways": "Sideways ➡"}[trend.weekly_trend]
+        monthly_lbl = {"up": "Uptrend 📈", "down": "Downtrend 📉", "sideways": "Sideways ➡"}[trend.monthly_trend]
+        align_icon = "🟢" if trend.trend_alignment == "bullish" else ("🔴" if trend.trend_alignment == "bearish" else "🟡")
+        trend_lines.append(
+            f"**Multi-Timeframe:** Weekly: {weekly_lbl} | Monthly: {monthly_lbl} | "
+            f"{align_icon} Aligned: {trend.trend_alignment.capitalize()}"
+        )
     if snap.sma_20 is not None:
         trend_lines.append(f"**SMA20:** {_ma_label(snap.price, snap.sma_20, 'SMA20')}")
     if snap.sma_50 is not None:
@@ -197,11 +264,38 @@ def _build_alert_embed(result: SignalResult) -> discord.Embed:
     embed.add_field(name="Price", value=f"${result.price:.2f}", inline=True)
     if result.rsi is not None:
         embed.add_field(name="RSI", value=f"{result.rsi:.1f}", inline=True)
+    if result.fundamental_score is not None:
+        fund_pts = round(result.fundamental_score / 100 * 40)
+        layer_parts = [f"Fund: {fund_pts}/40"]
+        if result.trend_score is not None:
+            layer_parts.append(f"Trend: {result.trend_score:+d}/30")
+        layer_parts.append(f"Tech: {result.technical_score:+d}/30")
+        embed.add_field(name="Score Breakdown", value=" | ".join(layer_parts), inline=False)
     embed.add_field(
         name="Triggers",
         value="\n".join(f"• {t}" for t in result.triggers) or "None",
         inline=False,
     )
+    return embed
+
+
+def _build_suppressed_embed(entries: list[_SuppressedEntry]) -> discord.Embed:
+    embed = discord.Embed(
+        title="Suppressed Signals (last scan cycles)",
+        color=discord.Color.greyple(),
+    )
+    if not entries:
+        embed.description = "No suppressed signals recorded since last restart."
+        return embed
+
+    lines = []
+    for e in entries:
+        gate_note = " ⛔ gate failed" if not e.gate_passed else ""
+        lines.append(
+            f"**{e.ticker}** [{e.signal_type}] score={e.score:+d}{gate_note}"
+            f"\n  _{e.reason}_ · {e.timestamp.strftime('%H:%M')} UTC"
+        )
+    embed.description = "\n".join(lines)
     return embed
 
 
@@ -436,13 +530,37 @@ class Scanner(commands.Cog):
         for item in tickers:
             ticker = item["ticker"]
             try:
-                snap = await asyncio.to_thread(compute_indicators, ticker)
+                snap, trend = await asyncio.to_thread(compute_extended_indicators, ticker)
                 if snap is None:
                     continue
-                result = evaluate_signals(snap)
+
+                fa = await asyncio.to_thread(get_fundamentals, ticker)
+                fs = score_fundamentals(fa)
+
+                # ETFs have no earnings — skip the earnings gate, use neutral fundamentals
+                if fa and fa.get("quote_type") == "ETF":
+                    fs = FundamentalScore(score=50, passed_gate=True, reasons=["ETF — earnings gate skipped"])
+
+                result = evaluate_composite_signal(snap, fs, trend)
 
                 # Only alert on BUY or STRONG BUY
                 if result.signal_type not in ("BUY", "STRONG BUY"):
+                    reason = (
+                        "Fundamental gate failed" if not result.gate_passed
+                        else f"Score {result.score} below BUY threshold (35)"
+                    )
+                    log.info(
+                        "Suppressed %s: %s (score=%d, gate_passed=%s)",
+                        ticker, result.signal_type, result.score, result.gate_passed,
+                    )
+                    _suppressed_buffer.append(_SuppressedEntry(
+                        ticker=ticker,
+                        signal_type=result.signal_type,
+                        score=result.score,
+                        gate_passed=result.gate_passed,
+                        reason=reason,
+                        timestamp=datetime.utcnow(),
+                    ))
                     continue
 
                 # Anti-spam: skip if same signal in last 2 hours
@@ -459,6 +577,9 @@ class Scanner(commands.Cog):
                     volume=result.volume,
                     rsi=result.rsi,
                     macd_hist=result.macd_hist,
+                    fundamental_score=result.fundamental_score,
+                    trend_score=result.trend_score,
+                    technical_score=result.technical_score,
                 )
 
                 if alert_channel:
@@ -476,15 +597,27 @@ class Scanner(commands.Cog):
 
     @commands.command(name="check")
     async def check_ticker(self, ctx: commands.Context, ticker: str):
-        """Run indicators on any ticker. Usage: !check NVDA"""
+        """Run full composite analysis on any ticker. Usage: !check NVDA"""
         ticker = ticker.upper().strip()
         async with ctx.typing():
-            snap = await asyncio.to_thread(compute_indicators, ticker)
+            snap, trend = await asyncio.to_thread(compute_extended_indicators, ticker)
             if snap is None:
                 await ctx.send(f"Could not fetch data for **{ticker}**.")
                 return
-            result = evaluate_signals(snap)
-            embed = _build_check_embed(snap, result)
+
+            fa = await asyncio.to_thread(get_fundamentals, ticker)
+            fs = score_fundamentals(fa)
+
+            # ETFs have no earnings — skip the earnings gate
+            if fa and fa.get("quote_type") == "ETF":
+                fs = FundamentalScore(score=50, passed_gate=True, reasons=["ETF — earnings gate skipped"])
+
+            result = evaluate_composite_signal(snap, fs, trend)
+            embed = _build_check_embed(snap, result, trend=trend, fa=fa)
+
+            if fa is None:
+                embed.set_footer(text="⚠ Fundamentals unavailable — composite uses technical signals only")
+
             await ctx.send(embed=embed)
 
     @commands.command(name="fundamentals", aliases=["fa"])
@@ -522,6 +655,14 @@ class Scanner(commands.Cog):
                 f"{s['created_at']}\n  _{trigger_str}_"
             )
         embed.description = "\n".join(lines)
+        await ctx.send(embed=embed)
+
+
+    @commands.command(name="suppressed")
+    async def show_suppressed(self, ctx: commands.Context, limit: int = 20):
+        """Show recently suppressed signals (filtered by gate or score). Usage: !suppressed [limit]"""
+        entries = list(_suppressed_buffer)[-limit:]
+        embed = _build_suppressed_embed(entries)
         await ctx.send(embed=embed)
 
 

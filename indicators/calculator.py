@@ -5,7 +5,8 @@ from ta.momentum import RSIIndicator
 from ta.trend import MACD, SMAIndicator, EMAIndicator
 from ta.volatility import BollingerBands
 
-from services.market_data import get_daily_data, get_intraday_data
+from services.market_data import get_daily_data, get_intraday_data, get_weekly_data, get_monthly_data
+from indicators.trend import TrendAnalysis, analyze_trend
 
 
 @dataclass
@@ -178,6 +179,22 @@ def compute_indicators(ticker: str) -> IndicatorSnapshot | None:
         snap.errors.append(f"BB: {e}")
 
     return snap
+
+
+def compute_extended_indicators(ticker: str) -> tuple[IndicatorSnapshot | None, TrendAnalysis | None]:
+    """Compute all indicators plus multi-timeframe trend analysis.
+
+    Returns (snap, trend) where either can be None if data is unavailable.
+    """
+    snap = compute_indicators(ticker)
+    if snap is None:
+        return None, None
+
+    daily_df = get_daily_data(ticker)
+    weekly_df = get_weekly_data(ticker)
+    monthly_df = get_monthly_data(ticker)
+    trend = analyze_trend(daily_df, weekly_df, monthly_df)
+    return snap, trend
 
 
 def _safe_float(val) -> float | None:
